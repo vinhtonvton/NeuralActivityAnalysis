@@ -1,0 +1,675 @@
+---
+title: "PROJECT 141A"
+author: "Vinh Ton"
+date: "2023-04-17"
+output: html_document
+---
+
+# Predictive Modeling Based on Steinmetz et al. (2019) Mouse Trials
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = TRUE, echo = FALSE, message=FALSE, warning=FALSE, fig.align = "center")
+library('ggplot2')
+library('dplyr')
+library('tidyverse')
+library('kernlab')
+```
+
+
+
+```{r session setup, cache=TRUE}
+session=list()
+brainArea = list()
+for(i in 1:18){
+  session[[i]]=readRDS(paste('./sessions/session',i,'.rds',sep=''))
+  brainArea[[i]] = session[[i]]$brain_area
+  session[[i]] = as_tibble(session[[i]][-5])
+  session[[i]] = session[[i]] %>% mutate(n_brain_area = length(unique(brainArea[[i]]))) 
+}
+
+```
+
+#  Abstract
+
+We have been provided with a complex dataset collected by Steinmetz et al. which consisted of thousands of trials across hundreds of sessions of the neural activity of mice in response to visual stimuli (or the lack thereof). We have been tasked with exploring the data and integrating it in an attempt to fit a predictive model of the feedback type based off of the neural data and stimuli. In our explorations, we found that contrast, the average of the neural activities, the total of the neural activities, and the spread of the neural activities seemed to have noticeable affects. Through clustering, we were able to condense the neural activities into summary statistics. Of these statistics, our final model used the cluster average median, cluster average IQR, the contrast level, and the standardized sum of spikes. When used on the test data, we found a success rate of 72.5%, which could be further improved by using other variables we did not acknowledege in this report.
+
+
+# Introduction
+
+We have been provided with a subset of a dataset collected by Steinmetz et al (2019). Our objective is to predict the outcome, or feedback type (either correct or incorrect) based on the provided neural activity and the stimuli.
+
+The dataset is complex. There are 18 sessions, with each consisting of at least a hundred trials, each with a unique combination of number of trials, number of brain areas, and brain neurons tracked. Thus the project has been broken up into three parts: exploratory data analysis, data integration, and then the actual building of the model.
+
+The initial data was collected in November of 2019, which looked to try and distinguish which neurons were underlying the brain processes of "vision, choice, action, and behavioural engagement." The study revealed that there was an underlying organization of the neurons associated with these respective combinations, which will later inform our data integration process.
+
+# Exploratory Data Analysis
+
+Each of the 18 sessions consists of hundreds of trials. Thus, for each date, the corresponding feedback_type, contrast_left, and contrast_right is a list with hundreds of rows corresponding to each trial.
+
+Spks, meanwhile, is a list of matrices. Each trial has its own matrix. Each row of the matrix is a separate neuron, with each column being a recorded time bin. Each number indicates the number of neuron spikes within one time bin, of which the center of each is recorded under time, for that particular neuron. The primary challenge will be extrapolating the information from our spks variable, especially considering we will be dealing with hundreds of rows (neurons) in our dataset. Brain_area is the area in which the neuron that was recorded resides.
+
+While the other variables are relatively easy to visualize and compare, such as the number of brain areas, number of neurons, and number of trials, the "spks" are significantly more complex. Each trial has its own associated matrix of neuron spikes, which will have to be investigated in-depth in order to seek out neural patterns that may help in constructing our model.
+
+Also of note are the "time" variables, which is a list of 40 numbers which indicate the centers of time bins from when the stimuli was activated to 0.4 seconds afterwards.
+
+###
+
+### Data Structures & Hetereogeneity
+
+``` {r neurons}
+numNeurons = vector()
+for (i in 1:18){
+  session[[i]]$numNeurons = length(brainArea[[i]])
+}
+```
+
+### Number of Trials
+
+```{r trials}
+numTrials = vector()
+for (i in 1:18){
+  numTrials = c(numTrials, length(session[[i]]$contrast_left))
+}
+
+```
+
+```{r}
+dataStrucs = c("numNeurons", "contrast")
+table = cbind(1, session[[1]]$numNeurons[[1]], numTrials[[1]], length(unique(brainArea[[1]])))
+
+for (i in 2:18){
+  table= table %>% rbind( c(i, session[[i]]$numNeurons[[i]], numTrials[[i]], length(unique(brainArea[[i]]))))
+}
+
+colnames(table) = c("Session #","# of Neurons", "# of Trials", "# Unique Brain Areas")
+
+table
+```
+We can see here that the 18 sessions have very different numbers of neurons, trials, and unique brain areas to track. Session 8, for example, has tracked 1157 neurons across 15 brain areas across 290 sessions. Contrast this with session 17, for example, which only tracked 565 neurons across 6 brain areas in 224 trials. 
+
+In particular, since the number of neurons is different per each trial, we will have to make sure that any particular summary statistics regarding the spikes matrices are standardized in some way. We will also have to standardize the number of brain areas across all 18 sessions, as using the brain areas alone will ignore the differences between sessions.
+
+Finally, because each session cannot be assumed to have been tracking the same neurons, especially due to the difference is number of neurons and the different brain areas, we will have to find a way to deal with this in our data integration process.
+
+
+### Stimuli Conditions 
+
+```{r stimuli}
+for (i in 1:18){
+  session[[i]] = session[[i]] %>% mutate(contrast = abs(contrast_left - contrast_right))
+}
+```
+
+It will be worth seeing if there is a correlation between high contrast, low contrast, and no contrast. To this extend, there has been a new variable created in the dataframe simply referred to as "contrast," which is the absolute value of the difference between the left contrast and the right contrast. The intution is that the feedback_type is not "left wheel" or "right wheel" but simply "correct" or "incorrect." Thus, the actual sign of the contrast should not matter. What matters more is that magnitude, as a stronger contrast difference should make a mouse more inclined to turn the wheel in the appropriate direction due to the extra sensory information.
+
+```{r}
+calcContrastSuccess = function(s.Num) {
+temp1 = session[[s.Num]] %>% filter(contrast > 0.5)
+temp2 = session[[s.Num]] %>% filter(contrast <= 0.5 & contrast != 0)
+temp3 = session[[s.Num]] %>% filter(contrast == 0, contrast_left!=0) #zero contrast due to equal contrast
+temp4 = session[[s.Num]] %>% filter(contrast == 0, contrast_left==0) #zero contrast due to no contrast
+
+prop1= cbind("Proportion"= (nrow(temp1 %>% filter(feedback_type==1))/nrow(temp1)), "Contrast" = 3) %>% as_tibble()
+
+prop2= cbind("Proportion"= (nrow(temp2 %>% filter(feedback_type==1))/nrow(temp2)), "Contrast" = 2) %>% as_tibble()
+
+prop3= cbind("Proportion"= (nrow(temp3 %>% filter(feedback_type==1))/nrow(temp3)), "Contrast" = 1) %>% as_tibble()
+
+prop4= cbind("Proportion"= (nrow(temp4 %>% filter(feedback_type==1))/nrow(temp4)), "Contrast" = 0) %>% as_tibble()
+
+successTbl = rbind(prop1, prop2, prop3, prop4) 
+return(successTbl)
+}
+```
+```{r}
+successPropTbl = calcContrastSuccess(1)
+for (i in 2:18){
+  tempTbl = calcContrastSuccess(i)
+  successPropTbl = rbind(successPropTbl, tempTbl)
+}
+
+
+successPropTbl %>% group_by(Contrast) %>% summarise(avgSuccess=mean(Proportion))
+
+```
+Here, I have constructed a table that separates "Contrast" into 4 different levels-- High contrast (absolute value>0.5, 3, low contrast (absolute value non zero <= 0.5, 2), equal contrast (contrast==0 AND both contrasts set to 0, 1), and zero contrast (contrast==0 AND both contrasts non zero).
+
+Here, we see interesting results. Averaged across all sessions, we see that when the contrast is high, the average success rate is at its highest, at a percentage of 79.84% success. When contrast is low but non-zero, we see that success rate is at its second highest at 73.47%. When contrast is equal, success rate is 50/50-- this makes sense as when contrast is equal, the correct choice is randomly selected. But when contrast is zero, we have a success rate of 67.21%. This suggests that there is a correlation between the type of contrast and the success rate. 
+
+As a result, when building our model, it will be worth treating contrast as a categorical variable according to these 4 categories of: High Contrast, Low Contrast, Equal Contrast, and Zero Contrast.
+
+```{r}
+for (i in 1:18){ #classify contrast into categorical variables
+test_variable = ifelse(session[[i]]$contrast>0.5, "High",
+                          ifelse(session[[i]]$contrast<=0.5 & session[[i]]$contrast>0, "Low",
+                          ifelse(session[[i]]$contrast==0 & session[[i]]$contrast_left==0, "Zero",
+                          "Equal")))
+
+session[[i]]$contrast_type = test_variable
+}
+```
+
+## Neural Activities
+
+
+```{r}
+buildSpikeTibble = function(s.Num, t.Num){
+sessionS = session[[s.Num]]
+sessionSspksN = sessionS$spks[[t.Num]]
+
+colnames(sessionSspksN) = sessionS$time[[t.Num]]
+sessionSspksN = as_tibble(sessionSspksN)
+
+sessionSspksN$brainArea = brainArea[[s.Num]]
+uniqueBrain = unique(brainArea[[s.Num]])
+
+areaFiltered = sessionSspksN %>% filter(brainArea==uniqueBrain[[1]])
+
+perAreaTibble = areaFiltered[-41] %>% colSums() %>% as_tibble()
+temp = rep(uniqueBrain[[s.Num]], 40) %>% as_tibble()
+spksTibble = cbind(perAreaTibble, temp, as_tibble(sessionS$time[[t.Num]]))
+
+for (j in 2:length(uniqueBrain)){
+  areaFiltered = sessionSspksN %>% filter(brainArea==uniqueBrain[j])
+perAreaTibble = areaFiltered[-41] %>% colSums() %>% as_tibble()
+temp = rep(uniqueBrain[j], 40) %>% as_tibble()
+temp = cbind(perAreaTibble, temp, as_tibble(sessionS$time[[t.Num]]))
+spksTibble = rbind(spksTibble, temp)
+}
+colnames(spksTibble) = c("sum", "brainArea", "timeBin")
+return(spksTibble)
+}
+#output is effectively a tibble, in which each row is the sum of all neurons within the same brain area in the same time bin
+#so if we wanted neuron count by brain area, we could just sum the sum per brainArea
+```
+
+```{r}
+createSpksChart = function(spksTibble, s.Num, t.Num, contrast){
+sessionS = session[[s.Num]]
+print(spksTibble %>% ggplot() + geom_line(mapping=aes(x=timeBin, y=sum, color=brainArea), position="stack") + ggtitle(paste("Session", s.Num, "Trial", t.Num, "Feedback:", sessionS$feedback_type[t.Num], "Contrast:", contrast)))
+}
+```
+
+```{r, cache=TRUE} 
+#nonzero contrast, feedback 1, |contrast|>0.5
+buildSpikeTibble(1,26) %>% createSpksChart(1, 26, "High")
+
+#nonzero contrast, feedback 1, |contrast|<=0.5
+buildSpikeTibble(1,69)%>% createSpksChart(1, 69, "Low")
+
+#zerocontrast, feedback=1
+buildSpikeTibble(1,21)%>% createSpksChart(1, 48, "Zero")
+
+#equal contrast, feedback=1
+buildSpikeTibble(1, 34) %>% createSpksChart(1, 34, "Equal")
+
+#feedback -1, |contrast|>0.5
+buildSpikeTibble(1,49)%>% createSpksChart(1, 49, "High")
+
+#nonzero contrast, feedback -1, |contrast|<=0.5
+buildSpikeTibble(1,22)%>% createSpksChart(1, 22, "Low")
+
+#zero contrast, feedback=-1
+buildSpikeTibble(1,23)%>% createSpksChart(1, 23, "Zero")
+
+#equal contrast, feedback=-1
+buildSpikeTibble(1,47)%>% createSpksChart(1, 47, "Equal")
+```
+Given that there are a number of complex conditions for feedback failure/success, and contrast rate, we will look at 8 possible combinations within 1 session, divided by brain area:
+
+Successful feedback, under high, low, 0, and equal contrast conditions;
+
+Unsuccessful feedback, under the same contrast conditions.
+
+Generally speaking, we can see that the neural activity generally remained the same for each brain area, i.e. regardless of where the neurons were placed, they followed the same patterns at approximately the same time bins.
+
+We can see that under high contrast conditions, the neurons seemed to consistently fire throughout the middle of the time bins, as opposed having multiple notable spikes.
+
+A similar pattern can be seen in the low-contrast graphs, in which the successful trial had a relatively consistent level of neuron activity, as opposed to the numerous spikes for the failed trial.
+
+The same can be said in the no-contrast graphs since the failed graph shows a number of spikes throughout the entire duration, while the successful graph showed relatively consistently with only minor spikes, with one exception.
+
+The equal-contrast graphs are interesting because both had similar patterns of having huge, consistent spikes regardless of type of feedback, likely owed to having to process multiple sources of visual information at the same time.
+
+And overall, it seemed that the trials in which feedback was a success generally speaking had higher spikes overall.
+
+```{r}
+buildSessionSpks = function(s.Num){
+highCSuccess = Reduce("+", (session[[s.Num]] %>% filter(abs(contrast)>0.5, feedback_type==1))$spks)
+
+lowCSuccess = Reduce("+", (session[[s.Num]] %>% filter(abs(contrast)<=0.5, contrast!=0, feedback_type==1))$spks)
+
+zeroCSuccess = Reduce("+",(session[[s.Num]] %>% filter(contrast==0, feedback_type==1, contrast_left ==0))$spks)
+
+noCSuccess = Reduce("+",(session[[s.Num]] %>% filter(contrast==0, feedback_type==1, contrast_left!=0))$spks)
+
+highCFail = Reduce("+", (session[[s.Num]] %>% filter(abs(contrast)>0.5, feedback_type==-1))$spks)
+
+lowCFail = Reduce("+", (session[[s.Num]] %>% filter(abs(contrast)<=0.5, contrast!=0, feedback_type==-1))$spks)
+
+zeroCFail = Reduce("+", (session[[s.Num]] %>% filter(contrast==0, feedback_type==-1, contrast_left==0))$spks)
+
+noCFail = Reduce("+",(session[[s.Num]] %>% filter(contrast==0, feedback_type==-1, contrast_left!=0))$spks)
+
+spksSessionMatrices = list(highCSuccess, lowCSuccess, zeroCSuccess, noCSuccess, highCFail, lowCFail, zeroCFail, noCFail)
+
+return(spksSessionMatrices)
+}
+
+```
+
+```{r}
+buildSpikeTibble2 = function(sumMatrix, s.Num){
+colnames(sumMatrix) = c(1:40)
+sumTibble = sumMatrix %>% as_tibble()
+sumTibble$brainArea = brainArea[[s.Num]]
+uniqueBrain = unique(brainArea[[s.Num]])
+
+areaFiltered = sumTibble %>% as_tibble() %>% filter(brainArea==uniqueBrain[[1]])
+
+perAreaTibble = areaFiltered[-41] %>% colSums() %>% as_tibble()
+temp = rep(uniqueBrain[[1]], 40) %>% as_tibble()
+spksTibble = cbind(perAreaTibble, temp, as_tibble(c(1:40)))
+for (j in 2:length(uniqueBrain)){
+  areaFiltered = sumTibble %>% filter(brainArea==uniqueBrain[j])
+perAreaTibble = areaFiltered[-41] %>% colSums() %>% as_tibble()
+temp = rep(uniqueBrain[j], 40) %>% as_tibble()
+temp = cbind(perAreaTibble, temp, as_tibble(c(1:40)))
+spksTibble = rbind(spksTibble, temp)
+}
+colnames(spksTibble) = c("sum", "brainArea", "timeBin")
+return(spksTibble)
+}
+```
+```{r}
+createSpksChart2 = function(spksTibble, s.Num, cLevel, feedback){
+sessionS = session[[s.Num]]
+print(spksTibble %>% ggplot() + geom_line(mapping=aes(x=timeBin, y=sum, color=brainArea), position="stack") + ggtitle(paste("Session", s.Num, "Overall", "Feedback:", feedback, "Contrast:", cLevel)))
+}
+```
+
+
+```{r, cache=TRUE}
+spksSessionMatrices = buildSessionSpks(1)
+spksSessionTibbles= lapply(spksSessionMatrices, buildSpikeTibble2, s.Num=1)
+fdback=c(1, 1, 1, 1, -1, -1, -1, -1)
+cLev = c(">0.5", "<=0.5", "0", "Equal", ">0.5", "<=0.5", "0", "Equal")
+for (i in 1:8){
+  spksSessionTibbles[[i]] %>% createSpksChart2(s.Num=1, cLevel=cLev[i], feedback=fdback[i])
+}
+```
+
+When looking at the neural activity across all trials for Session 1, we see similar patterns as when looking at the individual trials in that those trials with correct feedback are generally more stable, e.g. they have less spikes in activity and are instead more stable. This would suggest that those trials with correct feedback generally have more neural activity throughout the trial, as opposed to having lower activity with occasional spikes of "thought."
+
+### Comparing across Sessions
+```{r, cache=TRUE}
+spksSessionMatrices = buildSessionSpks(2)
+spksSessionTibbles= lapply(spksSessionMatrices, buildSpikeTibble2, s.Num=2)
+fdback=c(1, 1, 1, 1, -1, -1, -1, -1)
+cLev = c("High", "Low", "Zero","Equal", ">High", "Low", "0", "Equal")
+for (i in 1:8){
+  spksSessionTibbles[[i]] %>% createSpksChart2(s.Num=2, cLevel=cLev[i], feedback=fdback[i])
+}
+```
+
+When looking at corresponding graphs for session 2, we see similar patterns of consistency for successful sessions and more spikes for unsuccessful sessions.
+
+Since these patterns seem to be similar across multiple sessions, it is fair to say that when considering neural activities, there will be a few measures that will be important to consider when looking at our model:
+
+Measures of center, like mean and median, since on average, successful trials seemed to have higher average spikes.
+
+And measures of spread, like standard deviation or IQR, since successful trials seemed to be more consistent throughout the time bins.
+
+On top of this, it may also be worth considering looking at a standardized sum of spikes as an important spike variable, as well as minima and maxima; if successful trials generally have more we would expect higher minimums and maximums, and vice versa.
+
+
+# Data Integration
+```{r}
+createSummaryStats = function(s.Num){
+tempMatrix = Reduce("+", session[[s.Num]]$spks)
+sums = rowSums(tempMatrix) %>% as_tibble_col(column_name="rowsum")
+stdDev = sd(tempMatrix[1,])
+med = median(tempMatrix[1,])
+minVal = min(tempMatrix[1,])
+maxVal = max(tempMatrix[1,])
+iqrRow = IQR(tempMatrix[1,])
+for (i in 2:session[[s.Num]]$numNeurons[[1]]){
+  stdDev = c(stdDev, sd(tempMatrix[i,]))
+  med = c(med, median(tempMatrix[i,]))
+  minVal = c(minVal, min(tempMatrix[i,]))
+  maxVal = c(maxVal, max(tempMatrix[i,]))
+  iqrRow = c(iqrRow, IQR(tempMatrix[i,]))
+}
+
+stdDev = stdDev %>% as_tibble_col(column_name="rowsd")
+med = med%>% as_tibble_col(column_name="rowmedian")
+minVal = minVal %>% as_tibble_col(column_name="rowmin")
+maxVal = maxVal %>% as_tibble_col(column_name="rowmax")
+iqrRow = iqrRow %>% as_tibble_col(column_name="rowiqr")
+summaryStatsTbl = cbind(sums, stdDev, med, minVal, maxVal, iqrRow)
+summaryStatsTbl = summaryStatsTbl %>% mutate(average=rowsum/40)
+return(summaryStatsTbl)
+}
+
+```
+
+
+```{r}
+createkMeansCluster = function(summaryStatsTbl){
+summaryStatsk = summaryStatsTbl %>% kmeans(3)
+summaryStatsTbl =summaryStatsTbl %>% mutate(cluster=summaryStatsk$cluster)
+return(summaryStatsTbl)
+}
+```
+
+```{r}
+sessionSpksSum = NULL
+sessionSpksSum[[1]] = createSummaryStats(1) %>% createkMeansCluster()
+
+sessionSpksSum[[1]] %>% ggplot() + geom_point(mapping=aes(x=rowsum, y=rowsd, col=as.factor(cluster)))
+
+sessionNeuronClusters = list()
+sessionNeuronClusters[[1]] = sessionSpksSum[[1]]$cluster
+
+for (i in 2:18){
+  sessionSpksSum[[i]] = createSummaryStats(i) %>% createkMeansCluster()
+  sessionNeuronClusters[[i]] = sessionSpksSum[[i]]$cluster
+}
+```
+
+When it comes to integrating the data so that we have more information to build our model off of, the major issue is in the way that the neurons have been tracked. Each session tracks different neurons, different numbers of neurons, different numbers of brain areas, and different particular brain areas. However, judging from the goal of the original study, it can be safe to assume that the specific neurons tracked were likely subsets of larger groups that were linked to "vision, choice, [and] action." Thus if we are able to cluster the sets of neurons into these three groups, we could use group summary statistics to construct our model.
+
+In order to create these clusters, first, for every session, we sum together all the matrices so that we have 18 matrices total. Then for each row (neuron) in each matrix, we calculate:
+
+The sum and median across time bins.
+The standard deviation and IQR across time bins
+The minimum and maximum values across time bins
+
+Once we have these values, for each neuron per session, we will cluster into 3 groups-- for vision, choice, and action. The intuition driving this is that neurons which serve similar purposes should have similar summary statistics across time-- e.g. the neurons which serve the purpose of vision will have more similar minimum values with each other than with neurons that serve the task of "choice."
+
+That means each session will have their neurons clustered into 3 clusters, which should allow us to extract shared patterns across sessions and trials. For the purposes of this report, we will only be exploring k-means clustering. Above, we see the results of clustering for session 1, which shows 3 distinct groups.
+
+```{r message=FALSE}
+createTrialStats = function(s.Num, t.Num) {
+#creates colsums according to cluster for 1 session
+tempTibble = session[[s.Num]]$spks[[t.Num]] %>% as_tibble()
+tempTibble$cluster = sessionNeuronClusters[[s.Num]]
+
+#take column sums by cluster
+clusterTibbles = tempTibble %>% filter(cluster==1) %>% colSums()
+for (i in 2:3) {
+  clusterTibbles = rbind(clusterTibbles, tempTibble %>% filter(cluster==i) %>% colSums())
+}
+colnames(clusterTibbles) = c((1:40), "cluster")
+
+#final: 3 rows, 1 per cluster, 41 columns: the 40 time bins + the designated cluster
+clusterTibbles = as_tibble(clusterTibbles)
+
+#calculate, by row (cluster=1, 2, 3): mean, standard deviation, minval, maxval, iqr, median
+#for each cluster: find the respective summary statistic.
+
+#clustermeans = apply(clusterTibbles[,-41], 1, mean) %>% mean() %>% as_tibble
+#clusterSD = apply(clusterTibbles[,-41], 1, sd) %>% mean() %>% as_tibble()
+#clustermin = apply(clusterTibbles[,-41], 1, min) %>% mean() %>% as_tibble_()
+#clustermax = apply(clusterTibbles[,-41], 1, max) %>% mean() %>% as_tibble
+clusteriqr = apply(clusterTibbles[,-41], 1, IQR) %>% mean() %>% as_tibble()
+clustermed = apply(clusterTibbles[,-41], 1, median)%>% mean() %>% as_tibble()
+
+clusterStats = cbind(clusteriqr, clustermed)
+colnames(clusterStats) = c("avgClusterIQR", "avgClusterMed")
+clusterStats$spksSumStandardized = (session[[s.Num]]$spks[[t.Num]] %>% sum())/session[[s.Num]]$numNeurons[[1]]
+clusterStats$contrast = session[[s.Num]]$contrast_type[[t.Num]]
+clusterStats$feedbackType = session[[s.Num]]$feedback_type[[t.Num]]
+
+
+### used to build the intial model and explore best model with AIC fitting, but takes too long to run while formatting the report. Thus, for the sake of the final report, only need to include the variables in our final model.
+#clusterStats = cbind(clustermeans, clusterSD, clustermin, clustermax, clusteriqr, clustermed)
+#colnames(clusterStats) = c("avgClusterMeans", "avgClusterSD", "avgClusterMin", "avgClusterMax", "avgClusterIQR", "avgClusterMed")
+return(as_tibble(clusterStats))
+}
+```
+
+Once we have clustered the neurons, the next is to summarize their statistics. For each trial, we summed together the rows of neurons that were in the same cluster. Then, per cluster, we found: a mean, a standard deviation, a minimum, a maximum, and IQR, and a median. Then we averaged all of those values across all 3 clusters, which mean each trial had the following statistics:
+
+Average cluster mean
+Average cluster median
+Average cluster standard deviation
+Average cluster minimum
+Average cluster maximum
+Average cluster IQR
+
+We also assigned to each trial the contrast type (high, low, zero, or equal), and a standardized sum of neural spikes (e.g. the average across the entire neural matrix for a particular trial.)
+
+Finally, we combined all the trials together into 1 dataframe to build a model off of. In this case, a logistic regression model I considered most appropriate, as the outcome we are trying to predict (feedback_type) has only two possible outcomes: success or failure. Since the outcome is binary, it was most appropriate to fit a logistic regression model.
+
+
+```{r, message=FALSE,cache=TRUE}
+dataset = NULL
+for (i in 1:18){
+  for (j in 1:numTrials[[i]]) {
+    dataset = rbind(dataset, createTrialStats(i, j))
+  }
+}
+
+```
+
+```{r 1variable}
+newFeedback = ifelse(dataset$feedbackType==1, 1, 0)
+dataset$feedbackType = newFeedback
+```
+
+
+```{r}
+#all the code in the following chunk were used to determine the best model according to AIC
+# model = glm(feedbackType ~ avgClusterMeans + avgClusterSD + avgClusterMin + avgClusterMax + avgClusterIQR + avgClusterMed + spksSumStandardized + contrast, data=dataset)
+# 
+# initialModel = glm(feedbackType ~ 1, family="binomial", data=dataset)
+# model1 = glm(feedbackType~avgClusterMeans, family="binomial", data=dataset)
+# model2 = glm(feedbackType~avgClusterSD, family="binomial", data=dataset)
+# model3 = glm(feedbackType~avgClusterMin, family="binomial", data=dataset)
+# model4 = glm(feedbackType~avgClusterMax, family="binomial", data=dataset)
+# model5 = glm(feedbackType~avgClusterIQR, family="binomial", data=dataset)
+# model6 = glm(feedbackType~avgClusterMed, family="binomial", data=dataset)
+# model7 = glm(feedbackType~spksSumStandardized, family="binomial",data=dataset)
+# model8 = glm(feedbackType~contrast, family="binomial", data=dataset)
+# 
+# models = list(initialModel, model1, model2, model3, model4, model5, model6, model7, model8)
+# 
+# for (i in 1:length(models)){
+#   print(models[[i]]$aic)
+# }
+# 
+# #contrast reduces AIC the most, lets base it off that.
+# initialModel = glm(feedbackType ~ contrast, family="binomial", data=dataset)
+# model1 = glm(feedbackType~contrast+avgClusterMeans, family="binomial", data=dataset)
+# model2 = glm(feedbackType~contrast+avgClusterSD, family="binomial", data=dataset)
+# model3 = glm(feedbackType~contrast+avgClusterMin, family="binomial", data=dataset)
+# model4 = glm(feedbackType~contrast+avgClusterMax, family="binomial", data=dataset)
+# model5 = glm(feedbackType~contrast+avgClusterIQR, family="binomial", data=dataset)
+# model6 = glm(feedbackType~contrast+avgClusterMed, family="binomial", data=dataset)
+# model7 = glm(feedbackType~contrast+spksSumStandardized, family="binomial",data=dataset)
+# 
+# models = list(initialModel, model1, model2, model3, model4, model5, model6, model7)
+# 
+# for (i in 1:length(models)){
+#   print(models[[i]]$aic)
+# }
+# 
+# #contrast + spksSumStandardized is lowest at aic 5959.363-- use it
+# 
+# initialModel = glm(feedbackType ~ contrast + spksSumStandardized, family="binomial", data=dataset)
+# model1 = glm(feedbackType ~ contrast + spksSumStandardized + avgClusterMeans, data=dataset)
+# model2 = glm(feedbackType~contrast+ spksSumStandardized + avgClusterSD, family="binomial", data=dataset)
+# model3 = glm(feedbackType~contrast+ spksSumStandardized+ avgClusterMin, family="binomial", data=dataset)
+# model4 = glm(feedbackType~contrast+ spksSumStandardized+ avgClusterMax, family="binomial", data=dataset)
+# model5 = glm(feedbackType~contrast+ spksSumStandardized+ avgClusterIQR, family="binomial", data=dataset)
+# model6 = glm(feedbackType~contrast+ spksSumStandardized+ avgClusterMed, family="binomial", data=dataset)
+# models = list(initialModel, model1, model2, model3, model4, model5, model6)
+# 
+# for (i in 1:length(models)){
+#   print(models[[i]]$aic)
+# }
+# 
+# #avgClusterIQR reduces AIC the most-- 5944.221. Use this model.
+# 
+# initialModel = glm(feedbackType ~ contrast + spksSumStandardized + avgClusterIQR, family="binomial", data=dataset)
+# model1 = glm(feedbackType ~ contrast + spksSumStandardized + avgClusterIQR + avgClusterMeans, data=dataset)
+# model2 = glm(feedbackType~contrast+ spksSumStandardized + avgClusterIQR+ avgClusterSD, family="binomial", data=dataset)
+# model3 = glm(feedbackType~contrast+ spksSumStandardized+ avgClusterIQR+ avgClusterMin, family="binomial", data=dataset)
+# model4 = glm(feedbackType~contrast+ spksSumStandardized+ avgClusterIQR+ avgClusterMax, family="binomial", data=dataset)
+# model5 = glm(feedbackType~contrast+ spksSumStandardized+ avgClusterMed+ avgClusterIQR, family="binomial", data=dataset)
+# models = list(initialModel, model1, model2, model3, model4, model5)
+# for (i in 1:length(models)){
+#   print(models[[i]]$aic)
+# }
+# 
+# #we can see that means is now consistently increasing AIC-- no need to use.
+# #usingadding median further decreases AIC -- use this.
+# 
+# initialModel = glm(feedbackType ~ contrast + spksSumStandardized + avgClusterIQR + avgClusterMed, family="binomial", data=dataset)
+# model1 = glm(feedbackType ~ contrast + spksSumStandardized + avgClusterIQR + avgClusterMeans, data=dataset)
+# model2 = glm(feedbackType~contrast+ spksSumStandardized + avgClusterIQR+ avgClusterSD, family="binomial", data=dataset)
+# model3 = glm(feedbackType~contrast+ spksSumStandardized+ avgClusterIQR+ avgClusterMin, family="binomial", data=dataset)
+# model4 = glm(feedbackType~contrast+ spksSumStandardized+ avgClusterIQR+ avgClusterMax, family="binomial", data=dataset)
+# models = list(initialModel, model1, model2, model3, model4)
+# for (i in 1:length(models)){
+#   print(models[[i]]$aic)
+# }
+
+#at this point, we see that the only variable that decreases AIC is avgClusterMax, and only by a small model. Our final GLM will be based on contrast, spksSumStandardized, avgClsterIQR, avgClusterMed
+```
+We want to avoid overfitting our model so as to minimize our complexity, especially with such a complex dataset. Thus, we performed Forward Subset Selection using AIC as our criteria until we ended up with our final model, which predicts feedback type based on the categorical variable of contrast type, with the quantiative variables of spksSumStandardized, avgClusterIQR, and avgClusterMed. Below is the final dataset we will fit our model to. Note also that we have converted the feedbackType column to 0s for failures and 1s for successes, as opposed to using -1 for failures-- this is purely for the sake of the logistic regression model.
+
+```{r}
+finalModel = glm(feedbackType ~ contrast + spksSumStandardized + avgClusterIQR + avgClusterMed, family="binomial", data=dataset)
+summary(finalModel)
+```
+
+This table summarizes our logistic regression model we will try on the test dataset.
+
+# Prediction Performance
+
+We have been given 200 trials total-- 100 from session 1, and 100 from session 18. Given that, we need to prep the test data in the same way we prepared the training data, e.g. by classifying each trial by its contrast type, by clustering the neurons for each trial and finding the average cluster IQR and average cluster median, and by finding the standardized sum of spikes. Below is the final table after standardizing the data.
+
+```{r}
+sessionTest = NULL
+testNeuronClusters = NULL
+sessionTest[[1]] = readRDS('./test/test1.rds')
+sessionTest[[2]] = readRDS('./test/test2.rds')
+
+sessionTest[[1]] = sessionTest[[1]][-5] %>% as_tibble()
+sessionTest[[2]] = sessionTest[[2]][-5] %>% as_tibble()
+
+testNeuronClusters[[1]] = sessionNeuronClusters[[1]]
+testNeuronClusters[[2]] = sessionNeuronClusters[[18]]
+
+sessionTest[[1]]$numNeurons = session[[1]]$numNeurons[1:100]
+sessionTest[[2]]$numNeurons = session[[18]]$numNeurons[1:100]
+
+NUMTRIALS = 100
+```
+
+```{r}
+for (i in 1:2){
+  sessionTest[[i]] = sessionTest[[i]] %>% mutate(contrast = abs(contrast_left - contrast_right))
+}
+
+for (i in 1:2){ #classify contrast into categorical variables
+test_variable = ifelse(sessionTest[[i]]$contrast>0.5, "High",
+                          ifelse(sessionTest[[i]]$contrast<=0.5 & sessionTest[[i]]$contrast>0, "Low",
+                          ifelse(sessionTest[[i]]$contrast==0 & sessionTest[[i]]$contrast_left==0, "Zero",
+                          "Equal")))
+
+sessionTest[[i]]$contrast_type = test_variable
+}
+```
+
+```{r}
+createTestStats = function(s.Num, t.Num) {
+#creates colsums according to cluster for 1 session
+tempTibble = sessionTest[[s.Num]]$spks[[t.Num]] %>% as_tibble()
+tempTibble$cluster = testNeuronClusters[[s.Num]]
+
+#take column sums by cluster
+clusterTibbles = tempTibble %>% filter(cluster==1) %>% colSums()
+for (i in 2:3) {
+  clusterTibbles = rbind(clusterTibbles, tempTibble %>% filter(cluster==i) %>% colSums())
+}
+colnames(clusterTibbles) = c((1:40), "cluster")
+
+#final: 3 rows, 1 per cluster, 41 columns: the 40 time bins + the designated cluster
+clusterTibbles = as_tibble(clusterTibbles)
+
+#calculate, by row (cluster=1, 2, 3): mean, standard deviation, minval, maxval, iqr, median
+#for each cluster: find the respective summary statistic.
+clusteriqr = apply(clusterTibbles[,-41], 1, IQR) %>% mean() %>% as_tibble()
+clustermed = apply(clusterTibbles[,-41], 1, median)%>% mean() %>% as_tibble()
+
+clusterStats = cbind(clusteriqr, clustermed)
+colnames(clusterStats) = c("avgClusterIQR", "avgClusterMed")
+clusterStats$spksSumStandardized = (sessionTest[[s.Num]]$spks[[t.Num]] %>% sum())/sessionTest[[s.Num]]$numNeurons[[1]]
+clusterStats$contrast = sessionTest[[s.Num]]$contrast_type[[t.Num]]
+clusterStats$feedbackType = sessionTest[[s.Num]]$feedback_type[[t.Num]]
+return(as_tibble(clusterStats))
+}
+```
+
+```{r}
+testSet = NULL
+for (i in 1:2){
+  for (j in 1:NUMTRIALS){
+  testSet = rbind(testSet, createTestStats(i, j))
+  }
+}
+```
+```{r}
+newFeedback = ifelse(testSet$feedbackType==1, 1, 0)
+testSet$feedbackType = newFeedback
+```
+
+```{r}
+head(testSet)
+```
+Now, it is only a matter of predicting the data and using a confusion matrix to see how accurate our model is.
+
+```{r}
+y_predict = predict(finalModel, newdata=testSet[-5], type="response")
+y_pred21 = ifelse(y_predict > 0.5, 1, 0)
+cm = table(testSet$feedbackType, y_pred21>0.5)
+misclass = 1- (sum(diag(cm))/sum(cm))
+
+print("Confusion Matrix:")
+cm
+print(paste("Misclassification Rate: ",misclass*100, "%", sep=""))
+```
+
+# Discussion
+
+In short, in our data exploration, we found that the contrast type seemed to have a significant impact on the success of the trial. We also found that successful trials generally had greater total spikes and more consistent spike activity throughout the time. 
+
+In order to acknowledge the heterogeneous nature of the spike activity across the session, for each session, we clustered, using k-means clustering, the sum of the neural spike train matrices and used those clusters to calculate cluster medians and IQRs per trial. Then we used averages of those statistics, in addition to the contrast level, and the sum of spikes, to build a logistic regression model, ending up with a prediction model with a 72.5% success rate.
+
+Given the complex nature of the dataset, there are a number of things that could have improved upon this rate. For example, perhaps a different number of clusters would have yielded different results. In this report, we used k-means clustering with 3 centers, one each for "vision," "choice," and "action." However, maybe 4 means would have yielded more accurate results.
+
+It's also possible that a different regression model, such as linear discriminant analysis, would have led to a lower misclassification rate. 
+
+There are also some variables in the original dataset that went unused in our model. It is  possible that the exact date would have had an impact, or even that success rates varied drastically depending on the actual mouse.
+
+In the next steps, all these questions would be worth exploring in order to see if we can find a more accurate model.
+
+# Acknowledgements & Reference
+
+Reduce Function and usage from https://statisticsglobe.com/sum-list-matrices-r
+
+Steinmetz, N.A., Zatka-Haas, P., Carandini, M. et al. Distributed coding of choice, action and engagement across the mouse brain. Nature 576, 266–273 (2019). https://doi.org/10.1038/s41586-019-1787-x
+
+# Session Information
+
+```{r}
+sessionInfo()
+```
+
+# Appendix
+
+```{r, ref.label=knitr::all_labels(),echo=TRUE,eval=FALSE}
+```
